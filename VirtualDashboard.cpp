@@ -7,8 +7,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <xinput.h>
-#include <cmath>
 
 #include <atomic>
 #include <chrono>
@@ -28,7 +26,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace {
 
-constexpr char kVersion[] = "1.0.1";
+constexpr char kVersion[] = "1.1.0";
 constexpr char kSettingKey[] = "DashEnabled";
 
 // Inside the HUD speedometer update: rax = car-state object, rdi = HUD
@@ -42,7 +40,14 @@ constexpr std::uintptr_t kLightsOffset = 0x51A2; // car -> headlights on (byte)
 constexpr std::uintptr_t kRpm = 0x148;       // engine speed, rad/s
 constexpr std::uintptr_t kRedline = 0x1C8;   // where the red zone starts, rad/s
 constexpr std::uintptr_t kLimiter = 0x1CC;   // hard rev limiter, rad/s
-constexpr std::uintptr_t kBrake = 0xA8C;     // 0..1
+constexpr std::uintptr_t kClutch = 0xA8C;    // 0..1 (was mislabelled as brake)
+constexpr std::uintptr_t kBrake = 0xDFC;     // 0..1
+constexpr std::uintptr_t kHandbrake = 0xE08; // 0..1
+constexpr std::uintptr_t kPowerRaw = 0x16C;  // smooth power-like value, ~42.5 per kW (fitted to the in-game page)
+constexpr std::uintptr_t kBoost = 0x170;     // turbo boost
+constexpr std::uintptr_t kStateOffset = 0x4C08; // car -> car-state object
+constexpr std::uintptr_t kWorldRoot = 0x34ABA60; // exe global -> world -> clock/weather
+constexpr std::uintptr_t kDbgOffsets[] = {0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180, 0x188, 0x16C, 0x18C, 0x194, 0x198, 0x19C, 0x5C0, 0xA80, 0xA88, 0xAA4, 0xC4C, 0xF48, 0xF4C, 0xFA0, 0xDD8, 0xDDC};
 constexpr std::uintptr_t kGear = 0xBA4;      // int
 constexpr std::uintptr_t kThrottle = 0xDB4;  // 0..1
 constexpr std::uintptr_t kSteer = 0xE00;     // -1..1
@@ -56,6 +61,10 @@ struct Telemetry {
     float pos[3] = {};
     int gear = 0;
     int lights = 0;
+    int ind = 0;
+    float clutch = 0, handbrake = 0, torque = 0;
+    float boost = 0, time = -1, weather[3] = {};
+    float dbg[sizeof(kDbgOffsets) / sizeof(kDbgOffsets[0])] = {};
 };
 
 const FH2ModApi* g_api = nullptr;
@@ -65,9 +74,6 @@ std::filesystem::path g_ini_path;
 std::atomic<bool> g_enabled{true};
 std::atomic<int> g_port{8080};
 
-std::atomic<int> g_ind{0};
-std::atomic<const void*> g_car{nullptr};
-std::atomic<float> g_steer{0.0f};
 std::mutex g_json_mutex;
 std::string g_json = "{\"valid\":false}";
 
@@ -111,6 +117,17 @@ bool read_sample(const void* car, const void* state, Telemetry* t) {
         t->redline = *reinterpret_cast<const float*>(s + kRedline);
         t->limiter = *reinterpret_cast<const float*>(s + kLimiter);
         t->brake = *reinterpret_cast<const float*>(s + kBrake);
+        t->clutch = *reinterpret_cast<const float*>(s + kClutch);
+        t->handbrake = *reinterpret_cast<const float*>(s + kHandbrake);
+        {
+            const float om = *reinterpret_cast<const float*>(s + kRpm);
+            float kw = *reinterpret_cast<const float*>(s + kPowerRaw) / 42.5f;
+            if (!(kw > 0) || kw > 2000 || !(om > 50)) kw = 0;
+            t->torque = kw * 1000.0f / om;
+        }
+        t->boost = *reinterpret_cast<const float*>(s + kBoost);
+        for (std::size_t i = 0; i < sizeof(kDbgOffsets) / sizeof(kDbgOffsets[0]); ++i)
+            t->dbg[i] = *reinterpret_cast<const float*>(s + kDbgOffsets[i]);
         t->throttle = *reinterpret_cast<const float*>(s + kThrottle);
         t->steer = *reinterpret_cast<const float*>(s + kSteer);
         t->speed = *reinterpret_cast<const float*>(s + kSpeed);
@@ -131,19 +148,29 @@ float clean(float v) {
 }
 
 void publish(const Telemetry& t) {
-    char buf[768];
+    char buf[1536];
     if (!t.valid) {
         std::snprintf(buf, sizeof(buf), "{\"valid\":false}");
     } else {
-        std::snprintf(
+        const float omega = clean(t.rpm);
+        int n = std::snprintf(
             buf, sizeof(buf),
             "{\"valid\":true,\"car\":\"%s\",\"speed\":%.2f,\"rpm\":%.1f,"
             "\"redline\":%.1f,\"limiter\":%.1f,\"gear\":%d,\"throttle\":%.3f,\"brake\":%.3f,"
-            "\"steer\":%.3f,\"lights\":%d,\"ind\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}",
-            t.car, clean(t.speed), clean(t.rpm) * 9.5492966f,
-            clean(t.redline) * 9.5492966f, clean(t.limiter) * 9.5492966f, t.gear, clean(t.throttle),
-            clean(t.brake), clean(t.steer), t.lights, g_ind.load(), clean(t.pos[0]), clean(t.pos[1]),
-            clean(t.pos[2]));
+            "\"clutch\":%.3f,\"handbrake\":%.3f,\"torque\":%.1f,\"boost\":%.2f,\"power\":%.1f,"
+            "\"steer\":%.3f,\"lights\":%d,\"ind\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,"
+            "\"time\":%.0f,\"w0\":%.3f,\"w1\":%.3f,\"w2\":%.3f,\"dbg\":{",
+            t.car, clean(t.speed), omega * 9.5492966f, clean(t.redline) * 9.5492966f,
+            clean(t.limiter) * 9.5492966f, t.gear, clean(t.throttle), clean(t.brake),
+            clean(t.clutch), clean(t.handbrake), clean(t.torque), clean(t.boost),
+            clean(t.torque) * omega / 1000.0f, clean(t.steer), t.lights, t.ind, clean(t.pos[0]),
+            clean(t.pos[1]), clean(t.pos[2]), clean(t.time), clean(t.weather[0]),
+            clean(t.weather[1]), clean(t.weather[2]));
+        for (std::size_t i = 0; i < sizeof(kDbgOffsets) / sizeof(kDbgOffsets[0]) && n > 0 &&
+                                n < static_cast<int>(sizeof(buf)) - 40; ++i)
+            n += std::snprintf(buf + n, sizeof(buf) - n, "%s\"%zX\":%.3f", i ? "," : "",
+                               static_cast<std::size_t>(kDbgOffsets[i]), clean(t.dbg[i]));
+        std::snprintf(buf + n, sizeof(buf) - n, "}}");
     }
     std::lock_guard<std::mutex> lock(g_json_mutex);
     g_json = buf;
@@ -152,54 +179,33 @@ void publish(const Telemetry& t) {
 std::atomic<std::uint64_t> g_last_sample{0};
 std::atomic<bool> g_logged_car{false};
 char g_logged_name[64] = {};
+std::atomic<const void*> g_car{nullptr};
+std::atomic<int> g_ind{0};
+std::atomic<float> g_steer{0.0f};
+char g_car_name[64] = {};
 
-// Mirrors Extra Options' indicator logic from the D-pad: hold left/right for
-// 1 s to toggle a turn signal (cancelled by completing a turn), tap up for hazards.
-
-void update_indicators(const void* car, float steer) {
-    static const void* last_car = nullptr;
-    static WORD prev = 0;
-    static std::uint64_t down_at = 0;
-    static bool fired = false, turned = false;
-    static int mode = 0;  // bit0 left, bit1 right
-    static bool hazard = false;
-    const std::uint64_t now = GetTickCount64();
-    if (car != last_car) {
-        last_car = car;
-        mode = 0;
-        hazard = false;
-    }
-    WORD pad = 0;
-    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
-        XINPUT_STATE xs{};
-        if (XInputGetState(i, &xs) == ERROR_SUCCESS)
-            pad |= xs.Gamepad.wButtons & (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT |
-                                          XINPUT_GAMEPAD_DPAD_RIGHT);
-    }
-    if (pad != prev) {
-        if ((prev & XINPUT_GAMEPAD_DPAD_UP) && !(pad & XINPUT_GAMEPAD_DPAD_UP) &&
-            now - down_at < 500) {
-            hazard = !hazard;
-            if (hazard) mode = 0;
+// Game clock and weather, read from memory only (same chain the WeatherMenu tool uses).
+void fill_world(Telemetry& t) {
+    t.time = -1;
+    __try {
+        const auto rd = [](std::uintptr_t p) { return *reinterpret_cast<const std::uintptr_t*>(p); };
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(g_exe);
+        std::uintptr_t ctx = rd(base + kWorldRoot);
+        ctx = rd(rd(ctx + 0x48) + 0x98);
+        const std::uintptr_t clock = rd(ctx + 0x480), weather = rd(ctx + 0x488);
+        if (clock) {
+            const float v = *reinterpret_cast<const float*>(clock + 0x10);
+            if (v >= 0 && v <= 86401) t.time = v;
         }
-        prev = pad;
-        down_at = now;
-        fired = false;
+        if (weather) {
+            t.weather[0] = *reinterpret_cast<const float*>(weather + 0x8);
+            t.weather[1] = *reinterpret_cast<const float*>(weather + 0x5C);
+            t.weather[2] = *reinterpret_cast<const float*>(weather + 0x18);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
-    const int want = (pad & XINPUT_GAMEPAD_DPAD_LEFT) ? 1 : (pad & XINPUT_GAMEPAD_DPAD_RIGHT) ? 2 : 0;
-    if (want && !fired && now - down_at >= 1000) {
-        fired = true;
-        mode = (mode == want) ? 0 : want;
-        turned = false;
-        if (mode) hazard = false;
-    }
-    if (mode) {
-        const float dir = (mode == 1) ? -steer : steer;
-        if (dir > 0.25f) turned = true;
-        else if (turned && std::fabs(steer) < 0.08f) mode = 0;
-    }
-    g_ind.store(hazard ? 3 : mode);
 }
+
 void hud_hook(FH2Context* ctx, void*) {
     if (!g_enabled.load()) return;
     const std::uint64_t now = GetTickCount64();
@@ -215,8 +221,11 @@ void hud_hook(FH2Context* ctx, void*) {
     Telemetry t;
     if (!read_sample(car, reinterpret_cast<const void*>(ctx->rax), &t)) return;
     g_last_sample.store(now);
+    std::memcpy(g_car_name, t.car, sizeof(g_car_name));
     g_car.store(car);
-    g_steer.store(t.steer);
+    g_steer.store(clean(t.steer));
+    t.ind = g_ind.load();
+    fill_world(t);
     publish(t);
     if (std::strcmp(g_logged_name, t.car) != 0) {
         std::memcpy(g_logged_name, t.car, sizeof(g_logged_name));
@@ -225,16 +234,84 @@ void hud_hook(FH2Context* ctx, void*) {
     }
 }
 
-// Clears the page when the HUD stops updating (menus, loading, car swap).
+// Turn signals are emulated from the D-pad (same gestures as Extra Options):
+// hold left/right 1 s to toggle, tap up for hazards, steering cancels.
+// XInput is polled here, never on the game thread.
+struct XPad {
+    WORD buttons;
+    BYTE lt, rt;
+    SHORT lx, ly, rx, ry;
+};
+using XGetState = DWORD(WINAPI*)(DWORD, void*);
+
+void update_indicators(std::uint64_t now, WORD btn, float steer) {
+    static std::uint64_t down[3] = {};
+    static bool fired[3] = {};
+    static bool turned = false;
+    const WORD masks[3] = {0x4, 0x8, 0x1};
+    int ind = g_ind.load();
+    for (int i = 0; i < 3; ++i) {
+        const bool pressed = (btn & masks[i]) != 0;
+        if (pressed && !down[i]) { down[i] = now; fired[i] = false; }
+        if (pressed && i < 2 && !fired[i] && now - down[i] >= 1000) {
+            fired[i] = true;
+            ind = ind == i + 1 ? 0 : i + 1;
+            turned = false;
+        }
+        if (!pressed && down[i]) {
+            if (i == 2 && now - down[i] < 500) { ind = ind == 3 ? 0 : 3; turned = false; }
+            down[i] = 0;
+        }
+    }
+    if (ind == 1 || ind == 2) {
+        const float s = ind == 1 ? -steer : steer;
+        if (s > 0.35f) turned = true;
+        else if (turned && s < 0.1f) { ind = 0; turned = false; }
+    }
+    if (ind != g_ind.load()) {
+        g_ind.store(ind);
+        logf("Indicators now %d (1=left 2=right 3=hazard).", ind);
+    }
+}
+
+// Keeps the dashboard alive in menus (the HUD hook doesn't fire there) by
+// re-reading the last known car from memory only. Never calls game code.
 void watchdog() {
+    XGetState get_state = nullptr;
+    if (HMODULE x = LoadLibraryA("xinput1_4.dll"))
+        get_state = reinterpret_cast<XGetState>(GetProcAddress(x, "XInputGetState"));
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        update_indicators(g_car.load(), g_steer.load());
-        static std::uint64_t last_pub = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         const std::uint64_t now = GetTickCount64();
-        if (now - last_pub > 250) {
-            last_pub = now;
-            if (now - g_last_sample.load() > 1000) publish(Telemetry{});
+        WORD btn = 0;
+        if (get_state) {
+            XPad pad = {};
+            struct { DWORD packet; XPad gp; } st = {};
+            if (get_state(0, &st) == 0) { pad = st.gp; btn = pad.buttons; }
+        }
+        update_indicators(now, btn, g_steer.load());
+        if (now - g_last_sample.load() <= 100) continue;
+        const void* car = g_car.load();
+        Telemetry t;
+        bool ok = false;
+        if (car) {
+            __try {
+                const void* state = *reinterpret_cast<void* const*>(
+                    static_cast<const std::uint8_t*>(car) + kStateOffset);
+                ok = read_sample(car, state, &t) && t.car[0] &&
+                     std::strcmp(t.car, g_car_name) == 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            t.valid = true;
+            fill_world(t);
+            t.ind = g_ind.load();
+            publish(t);
+        } else {
+            g_car.store(nullptr);
+            publish(Telemetry{});
         }
     }
 }
