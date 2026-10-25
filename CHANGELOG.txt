@@ -1,0 +1,22 @@
+VirtualDashboard - Changelog
+
+v1.1.0 (changes since v1.0.1)
+-----------------------------
+New
+- Dashboard keeps working in all game menus, including the in-game Telemetry
+  screen. It shows "Waiting for a car in the game..." only during loading,
+  after a car swap, or when the connection to the PC is lost.
+- Tap the gear to show the current speed in its place. The gear moves to the speedometer centre. Tap again to go back.
+- RPM shows the digital value rounded to 50 by default (tap the gauge to switch).
+- Raw telemetry list: brake, handbrake, turbo boost (bar), power (kW),
+  torque (Nm), game time (HH:MM) and weather values.
+
+Fixed
+- The old "Brake" value was actually the clutch. It is now labelled Clutch,
+  and the real brake and handbrake values are read.
+- "Connection lost" now clears the displayed values instead of freezing them.
+
+Known issues
+- Power and torque are approximations (derived from an engine-power value) and
+  can differ from the in-game Telemetry page.
+- Turn signals are mirrored from the D-pad, not read from the game.
