@@ -147,6 +147,17 @@ float clean(float v) {
     return (v == v && v > -1e9f && v < 1e9f) ? v : 0.0f;
 }
 
+// Nitro level (0-100) from FnFNitro.dll if it is loaded, else -1. Looked up lazily: the mods load in any order.
+int read_nitro() {
+    using NitroFn = int (*)();
+    static NitroFn fn = nullptr;
+    if (!fn) {
+        if (HMODULE m = GetModuleHandleW(L"FnFNitro.dll"))
+            fn = reinterpret_cast<NitroFn>(GetProcAddress(m, "FnFNitro_GetNitroPercent"));
+    }
+    return fn ? fn() : -1;
+}
+
 void publish(const Telemetry& t) {
     char buf[1536];
     if (!t.valid) {
@@ -159,13 +170,13 @@ void publish(const Telemetry& t) {
             "\"redline\":%.1f,\"limiter\":%.1f,\"gear\":%d,\"throttle\":%.3f,\"brake\":%.3f,"
             "\"clutch\":%.3f,\"handbrake\":%.3f,\"torque\":%.1f,\"boost\":%.2f,\"power\":%.1f,"
             "\"steer\":%.3f,\"lights\":%d,\"ind\":%d,\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,"
-            "\"time\":%.0f,\"w0\":%.3f,\"w1\":%.3f,\"w2\":%.3f,\"dbg\":{",
+            "\"time\":%.0f,\"w0\":%.3f,\"w1\":%.3f,\"w2\":%.3f,\"nitro\":%d,\"dbg\":{",
             t.car, clean(t.speed), omega * 9.5492966f, clean(t.redline) * 9.5492966f,
             clean(t.limiter) * 9.5492966f, t.gear, clean(t.throttle), clean(t.brake),
             clean(t.clutch), clean(t.handbrake), clean(t.torque), clean(t.boost),
             clean(t.torque) * omega / 1000.0f, clean(t.steer), t.lights, t.ind, clean(t.pos[0]),
             clean(t.pos[1]), clean(t.pos[2]), clean(t.time), clean(t.weather[0]),
-            clean(t.weather[1]), clean(t.weather[2]));
+            clean(t.weather[1]), clean(t.weather[2]), read_nitro());
         for (std::size_t i = 0; i < sizeof(kDbgOffsets) / sizeof(kDbgOffsets[0]) && n > 0 &&
                                 n < static_cast<int>(sizeof(buf)) - 40; ++i)
             n += std::snprintf(buf + n, sizeof(buf) - n, "%s\"%zX\":%.3f", i ? "," : "",
